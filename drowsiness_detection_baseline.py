@@ -6,331 +6,735 @@ import numpy as np
 import winsound
 import os
 import time
+from collections import deque
+import sys
 
-# ====================== MEDIAPIPE SETUP ======================
-BaseOptions = python.BaseOptions
-FaceLandmarker = vision.FaceLandmarker
-FaceLandmarkerOptions = vision.FaceLandmarkerOptions
-VisionRunningMode = vision.RunningMode
+# ====================== SIMPLE SETUP ======================
+print("Starting Driver Monitoring System...")
 
+# Check if model exists
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
-
 if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(
-        f"Model file not found: {MODEL_PATH}\n"
-        "Download: https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    print("\n" + "="*60)
+    print("ERROR: face_landmarker.task not found!")
+    print("="*60)
+    print("Please download from:")
+    print("https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task")
+    print(f"\nSave it in: {os.path.dirname(__file__)}")
+    print("="*60)
+    input("Press Enter to exit...")
+    sys.exit(1)
+
+# Initialize MediaPipe
+try:
+    BaseOptions = python.BaseOptions
+    FaceLandmarker = vision.FaceLandmarker
+    FaceLandmarkerOptions = vision.FaceLandmarkerOptions
+    VisionRunningMode = vision.RunningMode
+
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=VisionRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
-
-options = FaceLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=VisionRunningMode.VIDEO,
-    num_faces=1,
-    min_face_detection_confidence=0.5,
-    min_face_presence_confidence=0.5,
-    min_tracking_confidence=0.5,
-)
-
-landmarker = FaceLandmarker.create_from_options(options)
+    landmarker = FaceLandmarker.create_from_options(options)
+    print("✓ MediaPipe model loaded")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    input("Press Enter to exit...")
+    sys.exit(1)
 
 # ====================== LANDMARK INDICES ======================
-LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
-MOUTH_INDICES = [61, 291, 0, 17, 37, 267]
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+MOUTH = [61, 291, 0, 17, 37, 267]
+FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
 
-# ====================== PARAMETERS ======================
-EYE_AR_THRESH = 0.25
-EYE_AR_CONSEC_FRAMES = 15
+# ====================== NATURAL THRESHOLDS ======================
+# Eye thresholds
+EYE_THRESH = 0.20
+BLINK_THRESH = 0.5  # Normal blink duration (seconds)
+DANGEROUS_CLOSURE_THRESH = 2.0  # Dangerous if eyes closed > 2 seconds
 
-MOUTH_AR_THRESH = 0.70
-MOUTH_AR_CONSEC_FRAMES = 20
+# Mouth thresholds
+MOUTH_THRESH = 0.70
+YAWN_THRESH = 2.5  # Yawn if mouth open > 2.5 seconds
 
-RISK_YAWN = 50
-RISK_DROWSY = 100
+# Head pose thresholds - Much more forgiving
+HEAD_TURN_THRESH = 0.30  # 30% head turn before considering "looking away"
 
-OCCLUSION_CONSEC_FRAMES = 3
+# TIMER-BASED THRESHOLDS (seconds)
+LOOK_LEFT_ALERT_TIME = 3.0      # Alert after looking left for 3 seconds
+LOOK_RIGHT_ALERT_TIME = 3.0     # Alert after looking right for 3 seconds
+LOOK_DOWN_ALERT_TIME = 4.0      # Alert after looking down for 4 seconds (phone use)
+DISTRACTED_ALERT_TIME = 4.0     # Alert after any distraction for 4 seconds
+NO_FACE_ALERT_TIME = 5.0        # Alert after face missing for 5 seconds
 
-MAR_SMOOTH_WINDOW = 5
+# Consecutive frames for other warnings
+DROWSY_CONSECUTIVE_FRAMES = 20  # Need 20 frames of eye closure
+YAWN_CONSECUTIVE_FRAMES = 10
 
-ALARM_SOUND_FILE = "alarm.wav"  # optional .wav file
+# Alarm cooldown
+ALARM_COOLDOWN = 5  # seconds between same alarm type
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Cannot access webcam")
-    exit()
+# ====================== WARNING TYPES ======================
+WARNING_TYPES = {
+    'DROWSY': {
+        'message': 'DROWSY DETECTED!',
+        'color': (0, 0, 255),
+        'sound': 'beep',
+        'priority': 5
+    },
+    'YAWNING': {
+        'message': 'EXCESSIVE YAWNING!',
+        'color': (0, 165, 255),
+        'sound': 'beep',
+        'priority': 4
+    },
+    'LOOKING_LEFT': {
+        'message': 'LOOKING LEFT TOO LONG!',
+        'color': (255, 255, 0),
+        'sound': 'beep',
+        'priority': 3
+    },
+    'LOOKING_RIGHT': {
+        'message': 'LOOKING RIGHT TOO LONG!',
+        'color': (255, 255, 0),
+        'sound': 'beep',
+        'priority': 3
+    },
+    'PHONE': {
+        'message': 'PHONE DETECTED!',
+        'color': (255, 0, 255),
+        'sound': 'double_beep',
+        'priority': 4
+    },
+    'NO_FACE': {
+        'message': 'FACE NOT VISIBLE!',
+        'color': (128, 128, 128),
+        'sound': 'beep',
+        'priority': 2
+    },
+    'MICROSLEEP': {
+        'message': 'MICROSLEEP DETECTED!',
+        'color': (0, 0, 255),
+        'sound': 'continuous',
+        'priority': 5
+    }
+}
 
-eye_closed_counter = 0
-yawn_counter = 0
-occlusion_counter = 0
-drowsiness_status = "Alert"
-alert_triggered = False
-alarm_active = False
-risk_score = 0
-acknowledge_pressed = False
-
-mar_history = []
-frame_count = 0
-
-last_alarm_time = 0
-ALARM_INTERVAL = 1.2
-
-def eye_aspect_ratio(eye):
-    A = np.linalg.norm(eye[1] - eye[5])
-    B = np.linalg.norm(eye[2] - eye[4])
-    C = np.linalg.norm(eye[0] - eye[3])
-    return (A + B) / (2.0 * C)
-
-def mouth_aspect_ratio(mouth):
-    vert1 = np.linalg.norm(mouth[2] - mouth[3])
-    vert2 = np.linalg.norm(mouth[4] - mouth[5])
-    horiz = np.linalg.norm(mouth[0] - mouth[1])
-    mar = (vert1 + vert2) / (2.0 * horiz)
-    return mar
-
-def play_alarm():
-    global last_alarm_time
-    current_time = time.time()
-    if current_time - last_alarm_time >= ALARM_INTERVAL:
-        if os.path.exists(ALARM_SOUND_FILE):
-            winsound.PlaySound(ALARM_SOUND_FILE, winsound.SND_FILENAME | winsound.SND_ASYNC)
-        else:
-            winsound.Beep(2800, 700)
-            time.sleep(0.1)
-            winsound.Beep(1800, 500)
-        last_alarm_time = current_time
-
-print("Drowsiness + Occlusion Detection – Camera stays open until 'Q/q' pressed")
-print("Press 'Q'/'q' to quit | Press 'A' to acknowledge alarm")
-
-cv2.namedWindow("Driver Drowsiness Detection", cv2.WINDOW_NORMAL)
-cv2.setWindowProperty("Driver Drowsiness Detection", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Webcam disconnected – stopping.")
-        break
-
-    frame = cv2.flip(frame, 1)
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-
-    timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
-    if timestamp_ms < 0:
-        timestamp_ms = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
-
-    detection_result = landmarker.detect_for_video(mp_image, timestamp_ms)
-
-    face_detected_now = bool(detection_result.face_landmarks)
-
-    # Occlusion detection
-    if not face_detected_now:
-        occlusion_counter += 1
-    else:
-        occlusion_counter = 0
-
-    is_occluded = occlusion_counter >= OCCLUSION_CONSEC_FRAMES
-
-    face_detected = False
-    x_min = y_min = x_max = y_max = 0
-
-    eye_drowsy = False
-    yawn_drowsy = False
-
-    if face_detected_now:
-        face_detected = True
-        face_landmarks = detection_result.face_landmarks[0]
-        h, w, _ = frame.shape
-        landmarks = np.array([(lm.x * w, lm.y * h) for lm in face_landmarks])
-
-        left_eye = landmarks[LEFT_EYE_INDICES]
-        right_eye = landmarks[RIGHT_EYE_INDICES]
-        ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
-
-        mouth = landmarks[MOUTH_INDICES]
-        mar_raw = mouth_aspect_ratio(mouth)
-
-        mar_history.append(mar_raw)
-        if len(mar_history) > MAR_SMOOTH_WINDOW:
-            mar_history.pop(0)
-        mar = np.mean(mar_history)
-
-        frame_count += 1
-        if frame_count % 30 == 0:
-            print(f"Smoothed MAR: {mar:.3f}")
-
-        for pt in left_eye.astype(int):
-            cv2.circle(frame, tuple(pt), 3, (0, 255, 0), -1)
-        for pt in right_eye.astype(int):
-            cv2.circle(frame, tuple(pt), 3, (0, 255, 0), -1)
-
-        is_yawning = mar > MOUTH_AR_THRESH
-        mouth_color = (0, 0, 255) if is_yawning else (100, 100, 100)
-        for pt in mouth.astype(int):
-            cv2.circle(frame, tuple(pt), 3, mouth_color, -1)
-
-        x_min, y_min = landmarks.min(axis=0).astype(int) - 10
-        x_max, y_max = landmarks.max(axis=0).astype(int) + 10
-        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-
-        if ear < EYE_AR_THRESH:
-            eye_closed_counter += 1
-            if eye_closed_counter >= EYE_AR_CONSEC_FRAMES:
-                eye_drowsy = True
-        else:
-            eye_closed_counter = 0
-
-        if mar > MOUTH_AR_THRESH:
-            yawn_counter += 1
-            if yawn_counter >= MOUTH_AR_CONSEC_FRAMES:
-                yawn_drowsy = True
-        else:
-            yawn_counter = 0
-
-        risk_score = 0
-        if eye_closed_counter > 5: risk_score += 40
-        if yawn_counter > 10 and mar > 0.65: risk_score += 30
-        if eye_drowsy: risk_score = RISK_DROWSY
-        elif yawn_drowsy: risk_score = RISK_YAWN
-
-        is_drowsy = eye_drowsy or yawn_drowsy
-
-        if is_drowsy:
-            drowsiness_status = "DROWSY!"
-            alarm_active = True
-            if not alert_triggered:
-                alert_triggered = True
-        else:
-            drowsiness_status = "Alert"
-            alert_triggered = False
-            if alarm_active and not acknowledge_pressed:
-                alarm_active = False
-
-    else:
-        drowsiness_status = "Alert"
-        risk_score = 0
-        alert_triggered = False
-
-    # ALARM LOGIC
-    trigger_alarm = (eye_drowsy or yawn_drowsy) or is_occluded
-
-    if trigger_alarm:
-        alarm_active = True
-        play_alarm()
-
-        flash_color = (0, 0, 255) if int(time.time() * 5) % 2 == 0 else (255, 255, 0)
+# ====================== TIMER-BASED DETECTOR ======================
+class TimerBasedDetector:
+    def __init__(self):
+        # Timers for different behaviors
+        self.looking_left_start = None
+        self.looking_right_start = None
+        self.looking_down_start = None
+        self.no_face_start = None
+        self.current_look_direction = "CENTER"
         
-        if is_occluded:
-            msg = "FACE BLOCKED!"
-            sub_msg = "Hand/object detected – Press A"
+    def update_head_direction(self, head_turn, looking_down, current_time):
+        """Update timers based on head direction"""
+        warnings = []
+        
+        # Determine current look direction
+        if looking_down:
+            direction = "DOWN"
+        elif head_turn > HEAD_TURN_THRESH:
+            direction = "RIGHT"
+        elif head_turn < -HEAD_TURN_THRESH:
+            direction = "LEFT"
         else:
-            msg = "WAKE UP!"
-            sub_msg = "Drowsiness detected – Press A"
+            direction = "CENTER"
+        
+        # Reset timers when direction changes
+        if direction != self.current_look_direction:
+            # Reset all timers
+            self.looking_left_start = None
+            self.looking_right_start = None
+            self.looking_down_start = None
+            self.current_look_direction = direction
+        
+        # Start or update timers based on current direction
+        if direction == "LEFT":
+            if self.looking_left_start is None:
+                self.looking_left_start = current_time
+            else:
+                duration = current_time - self.looking_left_start
+                if duration > LOOK_LEFT_ALERT_TIME:
+                    warnings.append(('LOOKING_LEFT', duration))
+        
+        elif direction == "RIGHT":
+            if self.looking_right_start is None:
+                self.looking_right_start = current_time
+            else:
+                duration = current_time - self.looking_right_start
+                if duration > LOOK_RIGHT_ALERT_TIME:
+                    warnings.append(('LOOKING_RIGHT', duration))
+        
+        elif direction == "DOWN":
+            if self.looking_down_start is None:
+                self.looking_down_start = current_time
+            else:
+                duration = current_time - self.looking_down_start
+                if duration > LOOK_DOWN_ALERT_TIME:
+                    warnings.append(('PHONE', duration))
+        
+        return warnings, direction
+    
+    def get_duration(self, direction):
+        """Get current duration for a specific direction"""
+        current_time = time.time()
+        if direction == "LEFT" and self.looking_left_start:
+            return current_time - self.looking_left_start
+        elif direction == "RIGHT" and self.looking_right_start:
+            return current_time - self.looking_right_start
+        elif direction == "DOWN" and self.looking_down_start:
+            return current_time - self.looking_down_start
+        return 0
 
-        # Slightly lower position
-        text_y_offset = frame.shape[0] // 3 + 140   # ← adjusted lower here
-        text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 5)[0]
-        text_x = (frame.shape[1] - text_size[0]) // 2
-        text_y = text_y_offset
+# ====================== SIMPLIFIED DETECTOR CLASSES ======================
+class BlinkDetector:
+    def __init__(self):
+        self.blink_start = None
+        self.is_blinking = False
+        self.drowsy_counter = 0
+        
+    def check(self, ear, current_time):
+        if ear < EYE_THRESH and not self.is_blinking:
+            self.is_blinking = True
+            self.blink_start = current_time
+            return "OPEN", 0
+            
+        elif ear >= EYE_THRESH and self.is_blinking:
+            self.is_blinking = False
+            duration = current_time - self.blink_start
+            if duration < BLINK_THRESH:
+                return "NORMAL_BLINK", duration
+            else:
+                return "LONG_BLINK", duration
+                
+        elif self.is_blinking:
+            duration = current_time - self.blink_start
+            if duration > DANGEROUS_CLOSURE_THRESH:
+                return "MICROSLEEP", duration
+            return "BLINKING", duration
+            
+        # Count consecutive closed frames for drowsiness
+        if ear < EYE_THRESH:
+            self.drowsy_counter += 1
+        else:
+            self.drowsy_counter = max(0, self.drowsy_counter - 2)
+            
+        return "OPEN", 0
+    
+    def is_drowsy(self):
+        return self.drowsy_counter > DROWSY_CONSECUTIVE_FRAMES
 
-        cv2.putText(frame, msg, (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, flash_color, 5)
+class MouthDetector:
+    def __init__(self):
+        self.mar_history = deque(maxlen=15)
+        self.yawn_start = None
+        self.is_yawning = False
+        self.yawn_counter = 0
+        
+    def check(self, mar, current_time):
+        self.mar_history.append(mar)
+        avg_mar = np.mean(self.mar_history)
+        
+        if avg_mar > MOUTH_THRESH:
+            if not self.is_yawning:
+                self.is_yawning = True
+                self.yawn_start = current_time
+                return "YAWN_START"
+            else:
+                duration = current_time - self.yawn_start
+                if duration > YAWN_THRESH:
+                    self.yawn_counter += 1
+                    return "YAWNING"
+                return "YAWNING"
+        else:
+            if self.is_yawning:
+                self.is_yawning = False
+            return "NORMAL"
+    
+    def is_excessive_yawn(self):
+        return self.yawn_counter > 3
 
-        sub_size = cv2.getTextSize(sub_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 3)[0]
-        sub_x = (frame.shape[1] - sub_size[0]) // 2
-        cv2.putText(frame, sub_msg, (sub_x, text_y + 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 3)
+class HeadDetector:
+    def __init__(self):
+        self.turn_history = deque(maxlen=30)
+        
+    def estimate(self, landmarks, frame_shape):
+        h, w = frame_shape[:2]
+        nose = landmarks[1]
+        left_eye = np.mean(landmarks[LEFT_EYE], axis=0)
+        right_eye = np.mean(landmarks[RIGHT_EYE], axis=0)
+        
+        # Calculate head turn
+        face_center_x = (left_eye[0] + right_eye[0]) / 2
+        turn_amount = (nose[0] - face_center_x) / w
+        self.turn_history.append(turn_amount)
+        avg_turn = np.mean(self.turn_history)
+        
+        # Calculate looking down
+        chin = landmarks[152]
+        forehead = landmarks[10]
+        face_height = abs(forehead[1] - chin[1])
+        nose_position = (nose[1] - forehead[1]) / face_height
+        looking_down = nose_position > 0.7
+        
+        return {
+            'turn_amount': avg_turn,
+            'looking_down': looking_down
+        }
 
-    # KEY HANDLING
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q') or key == ord('Q'):
-        print("Quit pressed – exiting.")
-        break
-    if key == ord('a') or key == ord('A'):
-        print("Alarm acknowledged and stopped.")
-        alarm_active = False
+# ====================== MAIN MONITORING CLASS ======================
+class DriverMonitor:
+    def __init__(self):
+        self.blink = BlinkDetector()
+        self.mouth = MouthDetector()
+        self.head = HeadDetector()
+        self.timer = TimerBasedDetector()
+        
+        self.active_warnings = set()
+        self.warning_start_times = {}
+        self.last_alarm_time = {}
+        
+        self.no_face_start_time = None
+        self.risk_score = 0
+        self.primary_warning = "NORMAL"
+        
+        # Smoothing for risk score
+        self.risk_history = deque(maxlen=20)
+        
+    def process_frame(self, landmarks, face_detected):
+        current_time = time.time()
+        warnings = []
+        
+        # Handle face not detected
+        if not face_detected:
+            if self.no_face_start_time is None:
+                self.no_face_start_time = current_time
+                
+            no_face_duration = current_time - self.no_face_start_time
+            
+            if no_face_duration > NO_FACE_ALERT_TIME:
+                warnings.append(('NO_FACE', current_time))
+            
+            self.active_warnings = set([w[0] for w in warnings])
+            self.calculate_risk_score()
+            self.determine_primary_warning()
+            
+            return {
+                'ear': 0,
+                'mar': 0,
+                'head_state': {'turn_amount': 0, 'looking_down': False},
+                'direction': 'UNKNOWN',
+                'duration': no_face_duration,
+                'warnings': list(self.active_warnings),
+                'primary_warning': self.primary_warning,
+                'risk_score': self.risk_score
+            }
+        
+        # Face detected - reset
+        self.no_face_start_time = None
+        
+        # Get landmarks
+        if landmarks is None or len(landmarks) == 0:
+            return self.process_frame(np.array([]), False)
+        
+        h, w = landmarks.shape[:2]
+        
+        # Calculate EAR
+        left_eye = landmarks[LEFT_EYE]
+        right_eye = landmarks[RIGHT_EYE]
+        
+        left_ear = self.calculate_ear(left_eye)
+        right_ear = self.calculate_ear(right_eye)
+        ear = (left_ear + right_ear) / 2.0
+        
+        # Calculate MAR
+        mouth = landmarks[MOUTH]
+        mar = self.calculate_mar(mouth)
+        
+        # Check states
+        eye_state, eye_duration = self.blink.check(ear, current_time)
+        mouth_state = self.mouth.check(mar, current_time)
+        head_state = self.head.estimate(landmarks, (h, w))
+        
+        # Timer-based warnings (look left/right/down)
+        timer_warnings, direction = self.timer.update_head_direction(
+            head_state['turn_amount'], 
+            head_state['looking_down'], 
+            current_time
+        )
+        warnings.extend(timer_warnings)
+        
+        # Microsleep
+        if eye_state == "MICROSLEEP":
+            warnings.append(('MICROSLEEP', current_time))
+        
+        # Drowsy
+        elif self.blink.is_drowsy():
+            warnings.append(('DROWSY', current_time))
+        
+        # Yawning
+        if mouth_state == "YAWNING" and self.mouth.is_excessive_yawn():
+            warnings.append(('YAWNING', current_time))
+        
+        # Update active warnings
+        self.update_warnings(warnings, current_time)
+        self.calculate_risk_score()
+        self.determine_primary_warning()
+        
+        # Get current duration for display
+        duration = 0
+        if direction == "LEFT":
+            duration = self.timer.get_duration("LEFT")
+        elif direction == "RIGHT":
+            duration = self.timer.get_duration("RIGHT")
+        elif direction == "DOWN":
+            duration = self.timer.get_duration("DOWN")
+        
+        return {
+            'ear': ear,
+            'mar': mar,
+            'eye_state': eye_state,
+            'mouth_state': mouth_state,
+            'head_state': head_state,
+            'direction': direction,
+            'duration': duration,
+            'warnings': list(self.active_warnings),
+            'primary_warning': self.primary_warning,
+            'risk_score': self.risk_score
+        }
+    
+    def calculate_ear(self, eye):
+        A = np.linalg.norm(eye[1] - eye[5])
+        B = np.linalg.norm(eye[2] - eye[4])
+        C = np.linalg.norm(eye[0] - eye[3])
+        return (A + B) / (2.0 * C + 0.001)
+    
+    def calculate_mar(self, mouth):
+        vert1 = np.linalg.norm(mouth[2] - mouth[3])
+        vert2 = np.linalg.norm(mouth[4] - mouth[5])
+        horiz = np.linalg.norm(mouth[0] - mouth[1])
+        return (vert1 + vert2) / (2.0 * horiz + 0.001)
+    
+    def update_warnings(self, new_warnings, current_time):
+        # Add new warnings
+        for warning, time in new_warnings:
+            self.active_warnings.add(warning)
+            if warning not in self.warning_start_times:
+                self.warning_start_times[warning] = time
+        
+        # Remove old warnings (after 3 seconds of being inactive)
+        to_remove = []
+        for warning in self.active_warnings:
+            if warning not in [w[0] for w in new_warnings]:
+                if current_time - self.warning_start_times.get(warning, 0) > 3.0:
+                    to_remove.append(warning)
+        
+        for warning in to_remove:
+            self.active_warnings.remove(warning)
+    
+    def calculate_risk_score(self):
+        priority_sum = 0
+        for warning in self.active_warnings:
+            priority_sum += WARNING_TYPES.get(warning, {}).get('priority', 0)
+        
+        raw_risk = min(100, priority_sum * 8)
+        self.risk_history.append(raw_risk)
+        self.risk_score = int(np.mean(self.risk_history)) if self.risk_history else 0
+    
+    def determine_primary_warning(self):
+        if not self.active_warnings:
+            self.primary_warning = "NORMAL"
+            return
+        self.primary_warning = max(self.active_warnings, 
+                                   key=lambda w: WARNING_TYPES.get(w, {}).get('priority', 0))
 
-    # ────────────────────────────────────────────────────────────────
-    # TOP-LEFT STATUS BOX
-    # ────────────────────────────────────────────────────────────────
+# ====================== MAIN FUNCTION ======================
+def main():
+    # Initialize camera
+    print("Opening camera...")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Cannot open camera")
+        input("Press Enter to exit...")
+        return
+    
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    print("✓ Camera ready")
+    
+    # Initialize monitor
+    monitor = DriverMonitor()
+    
+    # FPS calculation
+    fps = 0
+    fps_counter = 0
+    fps_time = time.time()
+    
+    # Frame skip for better performance
+    frame_skip = 2
+    frame_count = 0
+    
+    print("\n" + "="*70)
+    print("DRIVER MONITORING SYSTEM - NATURAL TIMER-BASED MODE")
+    print("="*70)
+    print("\nThe system uses TIMERS for natural head movements:")
+    print("  • Look left/right for 3+ seconds → Warning")
+    print("  • Look down for 4+ seconds → Phone warning")
+    print("  • Normal glances (<3 seconds) → No warning")
+    print("\nOther warnings (drowsy, yawn, microsleep) remain active")
+    print("\nControls:")
+    print("  Q - Quit")
+    print("  A - Acknowledge warnings")
+    print("="*70)
+    print("\nSystem running...\n")
+    
+    # Create window
+    cv2.namedWindow("Driver Monitor", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Driver Monitor", 800, 600)
+    
+    last_face_detection_time = time.time()
+    points = None
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Camera error, trying to reconnect...", end="\r")
+            time.sleep(0.1)
+            continue
+        
+        frame_count += 1
+        frame = cv2.flip(frame, 1)
+        
+        # Process every Nth frame
+        process_frame = (frame_count % frame_skip == 0)
+        
+        if process_frame:
+            try:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                timestamp = int(time.time() * 1000)
+                
+                detection = landmarker.detect_for_video(mp_image, timestamp)
+                
+                if detection.face_landmarks:
+                    last_face_detection_time = time.time()
+                    landmarks = detection.face_landmarks[0]
+                    h, w, _ = frame.shape
+                    points = np.array([(lm.x * w, lm.y * h) for lm in landmarks])
+                    face_detected = True
+                else:
+                    face_detected = False
+                    points = None
+                    
+            except Exception as e:
+                print(f"Detection error: {e}", end="\r")
+                face_detected = False
+                points = None
+        else:
+            face_detected = (points is not None and 
+                            (time.time() - last_face_detection_time) < 0.5)
+        
+        # Process monitoring data
+        data = monitor.process_frame(points if points is not None else np.array([]), face_detected)
+        
+        # Draw landmarks if face detected
+        if face_detected and points is not None:
+            # Draw eyes
+            eye_color = (0, 255, 0)
+            if data['eye_state'] in ["MICROSLEEP", "DANGEROUS_CLOSURE"]:
+                eye_color = (0, 0, 255)
+            
+            for point in points[LEFT_EYE].astype(int):
+                cv2.circle(frame, tuple(point), 2, eye_color, -1)
+            for point in points[RIGHT_EYE].astype(int):
+                cv2.circle(frame, tuple(point), 2, eye_color, -1)
+            
+            # Draw mouth
+            mouth_color = (0, 0, 255) if data['mouth_state'] == "YAWNING" else (100, 100, 100)
+            for point in points[MOUTH].astype(int):
+                cv2.circle(frame, tuple(point), 2, mouth_color, -1)
+            
+            # Draw head direction with timer visualization
+            nose = points[1].astype(int)
+            direction = data['direction']
+            
+            # Color code based on duration
+            if direction == "LEFT" and data['duration'] > 2.0:
+                color = (0, 0, 255)  # Red if close to warning
+            elif direction == "RIGHT" and data['duration'] > 2.0:
+                color = (0, 0, 255)
+            elif direction == "DOWN" and data['duration'] > 3.0:
+                color = (0, 0, 255)
+            else:
+                color = (255, 255, 0)  # Yellow for normal movement
+            
+            # Draw direction arrow
+            if direction != "CENTER":
+                end_point = (nose[0] + int(data['head_state']['turn_amount'] * frame.shape[1] * 2), nose[1])
+                cv2.arrowedLine(frame, tuple(nose), end_point, color, 2)
+                
+                # Show timer if looking away
+                if data['duration'] > 1.0:
+                    timer_text = f"{data['duration']:.1f}s"
+                    timer_color = (0, 0, 255) if data['duration'] > 2.5 else (255, 255, 0)
+                    cv2.putText(frame, timer_text, (nose[0] + 20, nose[1] - 20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, timer_color, 2)
+        
+        # ==================== DRAW UI ====================
+        h, w = frame.shape[:2]
+        
+        # Top status bar
+        cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 0), -1)
+        
+        # Primary warning
+        if data['primary_warning'] != "NORMAL":
+            warning_info = WARNING_TYPES.get(data['primary_warning'], WARNING_TYPES['DROWSY'])
+            cv2.putText(frame, warning_info['message'], (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, warning_info['color'], 2)
+            
+            # Trigger alarm
+            current_time = time.time()
+            if data['primary_warning'] not in monitor.last_alarm_time or \
+               current_time - monitor.last_alarm_time[data['primary_warning']] > ALARM_COOLDOWN:
+                try:
+                    if warning_info['sound'] == 'continuous':
+                        for _ in range(2):
+                            winsound.Beep(2000, 300)
+                            time.sleep(0.05)
+                    else:
+                        winsound.Beep(1000, 300)
+                except:
+                    print("\a", end="")
+                monitor.last_alarm_time[data['primary_warning']] = current_time
+        
+        # FPS
+        fps_counter += 1
+        if time.time() - fps_time >= 1.0:
+            fps = fps_counter
+            fps_counter = 0
+            fps_time = time.time()
+        cv2.putText(frame, f"FPS: {fps}", (w - 80, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # Left panel - Driver Status
+        panel_x, panel_y = 10, 50
+        panel_w, panel_h = 280, 180
+        
+        # Panel background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (20, 20, 40), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (255, 255, 255), 1)
+        
+        cv2.putText(frame, "DRIVER STATUS", (panel_x + 10, panel_y + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Status information
+        y_offset = 50
+        if face_detected:
+            # Overall status
+            status_text = "ALERT" if data['primary_warning'] == "NORMAL" else "CAUTION"
+            status_color = (0, 255, 0) if data['primary_warning'] == "NORMAL" else (0, 255, 255)
+            cv2.putText(frame, f"Status: {status_text}", (panel_x + 15, panel_y + y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+            y_offset += 25
+            
+            # Head direction with timer
+            if data['direction'] != "CENTER":
+                dir_text = f"Looking: {data['direction']} ({data['duration']:.1f}s)"
+                if data['duration'] > 2.5:
+                    dir_color = (0, 0, 255)
+                else:
+                    dir_color = (255, 255, 0)
+                cv2.putText(frame, dir_text, (panel_x + 15, panel_y + y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, dir_color, 1)
+                y_offset += 20
+            else:
+                cv2.putText(frame, "Looking: STRAIGHT", (panel_x + 15, panel_y + y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                y_offset += 20
+            
+            # Metrics
+            cv2.putText(frame, f"Eye: {data['ear']:.2f}", (panel_x + 15, panel_y + y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+            y_offset += 20
+            cv2.putText(frame, f"Mouth: {data['mar']:.2f}", (panel_x + 15, panel_y + y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        else:
+            cv2.putText(frame, "NO FACE DETECTED", (panel_x + 15, panel_y + 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        # Risk meter
+        meter_x = panel_x + 20
+        meter_y = panel_y + panel_h + 15
+        meter_w = panel_w - 40
+        meter_h = 20
+        
+        cv2.rectangle(frame, (meter_x, meter_y), (meter_x + meter_w, meter_y + meter_h), (50, 50, 50), -1)
+        risk_width = int((data['risk_score'] / 100) * meter_w)
+        risk_color = (0, 255, 0) if data['risk_score'] < 30 else (0, 255, 255) if data['risk_score'] < 60 else (0, 0, 255)
+        if risk_width > 0:
+            cv2.rectangle(frame, (meter_x, meter_y), (meter_x + risk_width, meter_y + meter_h), risk_color, -1)
+        cv2.putText(frame, f"RISK: {data['risk_score']}%", (meter_x, meter_y - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Active warnings display
+        if data['warnings']:
+            y_offset = panel_y + panel_h + 50
+            cv2.putText(frame, "ACTIVE WARNINGS:", (10, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            y_offset += 20
+            for warning in data['warnings'][:3]:
+                warning_info = WARNING_TYPES.get(warning, {})
+                cv2.putText(frame, f"• {warning_info.get('message', warning)}", (20, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, warning_info.get('color', (255, 255, 255)), 1)
+                y_offset += 18
+        
+        # Timer guide
+        timer_guide_y = h - 70
+        cv2.putText(frame, "TIMER GUIDE:", (10, timer_guide_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        cv2.putText(frame, "Left/Right: 3s | Down: 4s", (10, timer_guide_y + 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+        
+        # Instructions
+        cv2.putText(frame, "Q: Quit | A: Acknowledge", (w - 220, h - 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        
+        # Show frame
+        cv2.imshow("Driver Monitor", frame)
+        
+        # Handle keys
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            break
+        elif key == ord('a') or key == ord('A'):
+            monitor.active_warnings.clear()
+            monitor.risk_history.clear()
+            monitor.risk_score = 0
+            print("\nWarnings acknowledged")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    print("\nSystem stopped")
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (10, 8, 25), -1)
-    alpha = 0.35
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-    if face_detected:
-        cv2.rectangle(frame, (x_min-25, y_min-35), (x_max+25, y_max+45), (0, 140, 80), 8)
-        cv2.rectangle(frame, (x_min-12, y_min-22), (x_max+12, y_max+32), (0, 255, 160), 2)
-
-    panel_w, panel_h = 240, 180
-    panel_x = 20
-    panel_y = 20   # Top-left
-
-    cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (20, 20, 40), -1)
-    cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (100, 220, 255), 3)
-
-    status_text = f"{drowsiness_status.upper()}"
-    status_color = (100, 255, 140) if drowsiness_status == "Alert" else (255, 80, 80)
-    cv2.putText(frame, status_text, (panel_x + 20, panel_y + 50),
-                cv2.FONT_HERSHEY_DUPLEX, 1.2, (0,0,0), 6)
-    cv2.putText(frame, status_text, (panel_x + 17, panel_y + 47),
-                cv2.FONT_HERSHEY_DUPLEX, 1.2, status_color, 4)
-
-    risk_text = f"RISK: {risk_score}%"
-    cv2.putText(frame, risk_text, (panel_x + 20, panel_y + 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (220,220,255), 2)
-
-    bar_x = panel_x + 25
-    bar_y_eye = panel_y + 115
-    bar_y_yawn = panel_y + 145
-    bar_width = panel_w - 50
-    bar_height = 10
-
-    eye_progress = min(eye_closed_counter / EYE_AR_CONSEC_FRAMES, 1.0)
-    for i in range(bar_width):
-        r = int(255 * i / bar_width)
-        g = int(180 * (1 - i / bar_width))
-        b = 0
-        color = (b, g, r)
-        cv2.line(frame, (bar_x + i, bar_y_eye), (bar_x + i, bar_y_eye + bar_height),
-                 color if i < int(bar_width * eye_progress) else (60,60,60), 1)
-
-    cv2.putText(frame, "Eye", (bar_x - 15, bar_y_eye + 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220,220,255), 1)
-
-    yawn_progress = min(yawn_counter / MOUTH_AR_CONSEC_FRAMES, 1.0)
-    for i in range(bar_width):
-        r = int(255 * i / bar_width)
-        g = int(120 * (1 - i / bar_width))
-        b = 0
-        color = (b, g, r)
-        cv2.line(frame, (bar_x + i, bar_y_yawn), (bar_x + i, bar_y_yawn + bar_height),
-                 color if i < int(bar_width * yawn_progress) else (60,60,60), 1)
-
-    cv2.putText(frame, "Mouth", (bar_x - 25, bar_y_yawn + 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220,220,255), 1)
-
-    light_x = frame.shape[1] - 60
-    light_y = 40
-    light_color = (60, 255, 80) if drowsiness_status == "Alert" else (0, 60, 255)
-    cv2.circle(frame, (light_x, light_y), 22, light_color, -1)
-    cv2.circle(frame, (light_x, light_y), 26, (220, 220, 240), 2)
-
-    if drowsiness_status != "Alert":
-        tri_pts = np.array([
-            [light_x - 12, light_y + 35],
-            [light_x + 12, light_y + 35],
-            [light_x, light_y + 60]
-        ], np.int32)
-        cv2.fillPoly(frame, [tri_pts], (0, 0, 255))
-        cv2.putText(frame, "!", (light_x - 8, light_y + 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
-
-    if alarm_active:
-        border_color = (0, 0, 255) if int(time.time() * 6) % 2 == 0 else (255, 100, 100)
-        cv2.rectangle(frame, (0, 0), (frame.shape[1]-1, frame.shape[0]-1), border_color, 8)
-
-    cv2.imshow("Driver Drowsiness Detection", frame)
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        input("Press Enter to exit...")
